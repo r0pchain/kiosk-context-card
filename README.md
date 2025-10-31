@@ -18,7 +18,7 @@ First, you need to add kiosk-context-card.js to your Lovelace dashboard as a res
 
 If the endpoint's browser_mod is mapped, it will display the elements for that map. If an endpoint isn't mapped, it will display what's in "default." If "global" is defined, it will show that content for every endpoint. 
 
-Then, add a card in Lovelace with your browser_mod device mapping to kiosk-context-card and what you want to display per-device. I've included a sample YAML that demonstrates how it might work for your environment. 
+To display it in Lovelace, add a browser_mod device mapping as a kiosk-context-card and what you want to display per-device inside that mapping. I've included a sample YAML that demonstrates how it might work for your environment. 
 
 
 
