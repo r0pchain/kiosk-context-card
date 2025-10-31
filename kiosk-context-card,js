@@ -1,0 +1,307 @@
+/**************************************************************
+ * kiosk-context-card.js
+ * Simple Lovelace card that displays the current Browser Mod deviceID
+ * and optional room name from a mapping table.
+ *
+ * Running: Browser Mod ≥ 3.2, Home Assistant 2025.10+
+ *********************************************************************/
+// Robust probe for Browser Mod device ID across variants/localStorage/cookies
+function probeBrowserModId() {
+  try {
+    const bm = window.browser_mod;
+    // Common property names seen across versions
+    if (bm && (bm.deviceID || bm.browserID || bm.browserId || bm.browser_id)) {
+      return String(bm.deviceID || bm.browserID || bm.browserId || bm.browser_id);
+    }
+  } catch (e) { /* ignore */ }
+
+  // Scan localStorage for persisted IDs
+  try {
+    for (const k of Object.keys(localStorage)) {
+      const v = localStorage.getItem(k) || "";
+      // direct key/value hits
+      if (/browser_mod/i.test(k) && /browser_mod[_-][a-f0-9_]{8,}/i.test(k)) return k;
+      if (/browser_mod[_-][a-f0-9_]{8,}/i.test(v)) return v;
+      // JSON payloads that include the id
+      try {
+        const j = JSON.parse(v);
+        const id = j?.deviceID || j?.browser_id || j?.browserId || j?.browserID;
+        if (id) return String(id);
+      } catch (e2) { /* not JSON */ }
+    }
+  } catch (e) { /* ignore */ }
+
+  // Cookies (some kiosk setups mirror it here)
+  try {
+    const m = (document.cookie || "").match(/browser_mod[_-][a-f0-9_]{8,}/i);
+    if (m) return m[0];
+  } catch (e) { /* ignore */ }
+
+  // URL parameter fallback (?deviceID=KIOSK_FOO)
+  try {
+    const u = new URL(window.location.href);
+    const id = u.searchParams.get("deviceID") || u.searchParams.get("browser_id");
+    if (id) return String(id);
+  } catch (e) { /* ignore */ }
+
+  return null;
+}
+class KioskContextCard extends HTMLElement {
+
+  static getConfigElement() { return null; }
+  static getStubConfig() { return {}; }
+
+  setConfig(config) {
+    if (!config) throw new Error("Missing configuration");
+    this._config = config;
+    this.attachShadow({ mode: 'open' });
+    this._render();
+  }
+
+  async _getDeviceId() {
+    // First, fast path using robust probe
+    let id = probeBrowserModId();
+    if (id) return id;
+
+    // Then poll briefly to allow browser_mod to initialize
+    for (let i = 0; i < 40; i++) { // up to ~10s
+      await new Promise(r => setTimeout(r, 250));
+      id = probeBrowserModId();
+      if (id) return id;
+    }
+    return "unavailable";
+  }
+
+  async _render() {
+    const root = this.shadowRoot;
+    const cfg = this._config;
+    const id = await this._getDeviceId();
+    const normId = (id || "").toString();
+    const map = cfg.map || {};
+    // Resolve mapping: direct hit → lowercase → prefixed → default fallbacks
+    const roomCfg =
+      map[normId] ||
+      map[normId.toLowerCase?.()] ||
+      map[`browser_mod_${normId}`];
+
+    const defaultCfg = map["__default__"] || map["unknown"]; // legacy support
+    const effectiveCfg = roomCfg || defaultCfg || null;
+
+    const roomName = typeof effectiveCfg === "string" ? effectiveCfg : effectiveCfg?.name;
+    const roomCards = Array.isArray(effectiveCfg?.cards) ? effectiveCfg.cards : [];
+    const isUnmapped = !roomCfg && !!defaultCfg; // using default fallback
+
+    const style = `
+      :host {
+        display:block;
+        font-family: var(--primary-font-family);
+        padding: 1em;
+      }
+      .id-footer {
+        font-size: 0.75em;
+        opacity: 0.6;
+        text-align: right;
+        margin-top: 0.25em;
+      }
+      h2 {
+        margin:0 0 .25em 0;
+        font-size:1.5em;
+      }
+      pre {
+        background: var(--ha-card-background, #222);
+        color: var(--primary-text-color);
+        padding:.5em;
+        border-radius:4px;
+        overflow:auto;
+      }
+    `;
+
+    root.innerHTML = `
+      <style>${style}</style>
+      <h2>${roomName ? roomName : "❓ Unknown Room"}</h2>
+      <div id="content">
+        ${
+          roomName
+            ? (isUnmapped
+                ? ""   // default fallback in use; no extra paragraph
+                : `<p>This kiosk is in <strong>${roomName}</strong>.</p>`)
+            : `<p>This kiosk’s Browser Mod deviceID is not mapped:</p>
+               <pre>${normId}</pre>`
+        }
+      </div>
+    `;
+
+   
+
+    const normalizeCardConfig = (cfg) => {
+      if (!cfg || typeof cfg !== "object") return cfg;
+      // If type is omitted but entity provided, infer from domain
+      if (!cfg.type && typeof cfg.entity === "string") {
+        const domain = cfg.entity.split(".")[0];
+        if (domain === "light") return { type: "light", entity: cfg.entity, name: cfg.name };
+        return { type: "entity", entity: cfg.entity, name: cfg.name };
+      }
+      // Convert unsupported 'switch' card to a standard entity card
+      if (cfg.type === "switch") {
+        return { type: "entity", entity: cfg.entity, name: cfg.name };
+      }
+      return cfg;
+    };
+
+    const createThing = (cfg) => {
+      const ncfg = normalizeCardConfig(cfg);
+      const el = document.createElement(
+        ncfg.type && ncfg.type.startsWith("custom:")
+          ? ncfg.type.replace("custom:", "")
+          : `hui-${ncfg.type}-card`
+      );
+      el.setConfig(ncfg);
+      if (this._hass) el.hass = this._hass; // bind hass early
+      return el;
+    };
+
+    if (roomCards.length) {
+      const content = root.getElementById("content");
+      // Clear any previous children on re-render
+      while (content.firstChild) content.removeChild(content.firstChild);
+
+      // Prefer HA helpers for proper hydration
+      window.loadCardHelpers()
+        .then((helpers) => {
+          roomCards.forEach((cfg) => {
+            const ncfg = normalizeCardConfig(cfg);
+            const el = helpers.createCardElement(ncfg);
+            el.hass = this._hass; // ensure card gets HA context
+            content.appendChild(el);
+          });
+
+          // UNIVERSAL CONTENT: always shown if defined
+          const universalCfg = map["__universal__"];
+          if (universalCfg && Array.isArray(universalCfg.cards)) {
+            universalCfg.cards.forEach((cfg) => {
+              const ncfg = normalizeCardConfig(cfg);
+              const el = helpers.createCardElement(ncfg);
+              el.hass = this._hass;
+              content.appendChild(el);
+            });
+          }
+
+          // Append the id-footer div after all cards if isUnmapped
+          if (isUnmapped) {
+            const footerDiv = document.createElement("div");
+            footerDiv.className = "id-footer";
+            footerDiv.textContent = normId;
+            content.appendChild(footerDiv);
+          }
+        })
+        .catch(() => {
+          // fallback if helpers not yet available
+          roomCards.forEach((cfg) => {
+            const el = createThing(cfg);
+            content.appendChild(el);
+          });
+
+          // UNIVERSAL CONTENT: always shown if defined
+          const universalCfg = map["__universal__"];
+          if (universalCfg && Array.isArray(universalCfg.cards)) {
+            universalCfg.cards.forEach((cfg) => {
+              const el = createThing(cfg);
+              content.appendChild(el);
+            });
+          }
+
+          // Append the id-footer div after all cards if isUnmapped
+          if (isUnmapped) {
+            const footerDiv = document.createElement("div");
+            footerDiv.className = "id-footer";
+            footerDiv.textContent = normId;
+            content.appendChild(footerDiv);
+          }
+        });
+    } else {
+      // If no cards and isUnmapped, append the id-footer div as well
+      const content = root.getElementById("content");
+
+      // UNIVERSAL CONTENT: always shown if defined
+      const universalCfg = map["__universal__"];
+      if (universalCfg && Array.isArray(universalCfg.cards)) {
+        // Prefer HA helpers for proper hydration
+        window.loadCardHelpers()
+          .then((helpers) => {
+            universalCfg.cards.forEach((cfg) => {
+              const ncfg = normalizeCardConfig(cfg);
+              const el = helpers.createCardElement(ncfg);
+              el.hass = this._hass;
+              content.appendChild(el);
+            });
+
+            if (isUnmapped) {
+              const footerDiv = document.createElement("div");
+              footerDiv.className = "id-footer";
+              footerDiv.textContent = normId;
+              content.appendChild(footerDiv);
+            }
+          })
+          .catch(() => {
+            universalCfg.cards.forEach((cfg) => {
+              const el = createThing(cfg);
+              content.appendChild(el);
+            });
+
+            if (isUnmapped) {
+              const footerDiv = document.createElement("div");
+              footerDiv.className = "id-footer";
+              footerDiv.textContent = normId;
+              content.appendChild(footerDiv);
+            }
+          });
+      } else {
+        if (isUnmapped) {
+          const footerDiv = document.createElement("div");
+          footerDiv.className = "id-footer";
+          footerDiv.textContent = normId;
+          content.appendChild(footerDiv);
+        }
+      }
+    }
+  }
+
+  // Lovelace lifecycle hook
+  set hass(hass) {
+    this._hass = hass;
+
+    // Push live HA state to all child cards so they stay reactive
+    const root = this.shadowRoot;
+    if (root) {
+      const content = root.getElementById("content");
+      if (content && content.children.length) {
+        for (const child of content.children) {
+          try {
+            if ("hass" in child) child.hass = hass;
+          } catch (e) {
+            console.warn("KioskContextCard: failed to update hass for child", e);
+          }
+        }
+      }
+    }
+
+    // Initial render logic (run once)
+    if (!this._rendered) {
+      this._rendered = true;
+      this._render();
+
+      // Re-render again shortly after load to catch late browser_mod init
+      if (!this._rerenderScheduled) {
+        this._rerenderScheduled = true;
+        setTimeout(() => this._render(), 1500);
+      }
+    }
+  }
+}
+
+customElements.define('kiosk-context-card', KioskContextCard);
+KioskContextCard.version = "1.3.0";
+console.info(
+  `%cKiosk Context Card loaded v${KioskContextCard.version}`,
+  "color: lime; font-weight:bold;"
+);
